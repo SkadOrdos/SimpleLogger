@@ -1,10 +1,8 @@
 ﻿using System;
 using System.Collections.Concurrent;
 using System.IO;
-using System.Linq;
 using System.Text;
 using System.Threading;
-using System.Timers;
 using System.Xml.Serialization;
 
 namespace SimpleLogger
@@ -30,7 +28,7 @@ namespace SimpleLogger
         /// Log time
         /// </summary>
         public readonly DateTime Time;
-        
+
         /// <summary>
         /// New log object
         /// </summary>
@@ -45,6 +43,7 @@ namespace SimpleLogger
     }
 
 
+    [Serializable]
     public class LogSettings
     {
         public LogSettings()
@@ -94,23 +93,13 @@ namespace SimpleLogger
 
     public class Logger : IDisposable
     {
-        /// <summary>
-        /// Current loggers settings
-        /// </summary>
         public LogSettings Settings { get; protected set; }
 
-        /// <summary>
-        /// Encoding for logs
-        /// </summary>
-        public Encoding Encoding = System.Text.Encoding.UTF8;
-
-
-        StringBuilder logBuffer;
         protected Thread LogProcessor;
         protected AutoResetEvent WaitData;
         protected ConcurrentQueue<LogArgs> Queue;
 
-        static readonly object syncRoot = new Object();
+        public static readonly object SyncRoot = new Object();
 
         public const string LoggerSettingsName = "logger";
         public const string LoggerSettingsExt = ".xml";
@@ -131,7 +120,13 @@ namespace SimpleLogger
             get { return LoggerSettingsName + LoggerSettingsExt; }
         }
 
-        static Logger log2file;
+        /// <summary>
+        /// Encoding for logs
+        /// </summary>
+        public Encoding Encoding = System.Text.Encoding.UTF8;
+
+
+        volatile static Logger log2file;
         /// <summary>
         /// Logger instance by loaded settings
         /// </summary>
@@ -139,7 +134,7 @@ namespace SimpleLogger
         {
             get
             {
-                lock (syncRoot)
+                lock (SyncRoot)
                 {
                     if (log2file == null)
                     {
@@ -159,7 +154,7 @@ namespace SimpleLogger
         /// <returns>Logger instance</returns>
         public static Logger CreateSpecificInstance(LogSettings settings)
         {
-            lock (syncRoot)
+            lock (SyncRoot)
             {
                 if (log2file != null) log2file.Dispose();
 
@@ -199,8 +194,6 @@ namespace SimpleLogger
         protected Logger()
         {
             WaitData = new AutoResetEvent(false);
-
-            logBuffer = new StringBuilder();
             Queue = new ConcurrentQueue<LogArgs>();
 
             LogProcessor = new Thread(new ThreadStart(LogLoop));
@@ -292,7 +285,6 @@ namespace SimpleLogger
             if (!isDisposing && isStarted)
             {
                 Info("Logger stopped");
-                __DumpToLogFile();
                 isStarted = false;
             }
         }
@@ -309,15 +301,9 @@ namespace SimpleLogger
 
         protected virtual void Dispose(bool disposing)
         {
-            if (!isDisposing)
-            {
-                // Write logs from queue
-                if (!WaitData.SafeWaitHandle.IsClosed)
-                    WaitData.Set();
-
-                Stop();
-                isDisposing = true;
-            }
+            Stop();
+            isDisposing = true;
+            WaitData.Set();
         }
 
 
@@ -328,8 +314,7 @@ namespace SimpleLogger
         private void Push(LogArgs o)
         {
             Queue.Enqueue(o);
-            if (!WaitData.SafeWaitHandle.IsClosed)
-                WaitData.Set();
+            WaitData.Set();
         }
 
         /// <summary>
@@ -347,85 +332,56 @@ namespace SimpleLogger
                     __WriteToLog(logObject);
                 }
             }
-            WaitData.Dispose();
         }
 
-        /// <summary>
-        /// Write to log from thread
-        /// </summary>
-        private void __WriteToLog(LogArgs args)
-        {
-            string label = args.Label;
-            string msg = args.Message;
-
-            if (String.IsNullOrEmpty(msg))
-                return;
-
-
-            string tLabel = label;
-            if (!String.IsNullOrEmpty(tLabel)) tLabel = String.Concat(tLabel, " ");
-            else tLabel = String.Empty;
-
-            string toLog = String.Concat(tLabel, "[", args.Time.ToString("dd MMM yyyy HH:mm:ss\\.fff"), "] ", msg);
-            lock (logBuffer)
-            {
-                logBuffer.AppendLine(toLog);                
-            }
-
-            __DumpToLogFile();
-        }
-
-        #region// Write to file
 
         private string lastFile;
         /// <summary>
-        /// Write all log to file and clear buffer
+        /// Write to log from thread
         /// </summary>
-        private void __DumpToLogFile()
+        private void __WriteToLog(object o)
         {
-            string allLog;
-            lock (logBuffer)
+            LogArgs args = (LogArgs)o;
+            string label = args.Label;
+
+            if (!String.IsNullOrEmpty(label))
+                label = String.Concat(label, " ");
+            else label = String.Empty;
+
+            if (args.Message != null && args.Message.Length > 0)
             {
-                if (logBuffer.Length == 0)
-                    return;
+                string logLine = String.Concat(label, "[", args.Time.ToString("dd MMM yyyy HH:mm:ss\\.fff"), "] ", args.Message, Environment.NewLine);
 
-                allLog = logBuffer.ToString();
-                logBuffer.Clear();
-            }
-
-            try
-            {
-                // First log file
-                if (!File.Exists(lastFile))
-                    Directory.CreateDirectory(Settings.LogFolderPath);
-
-                if (!String.IsNullOrEmpty(lastFile))
+                try
                 {
-                    FileInfo lf = new FileInfo(lastFile);
-                    if (lf.Exists && lf.Length > Settings.MaxFileSizeInBytes)
-                    {
-                        // Next file
-                        lastFile = GetNewFileName();
-                    }
-                }
-                else lastFile = GetNewFileName();
+                    if (!File.Exists(lastFile)) Directory.CreateDirectory(Settings.LogFolderPath);
 
-                using (var fileStream = new StreamWriter(lastFile, true, Encoding))
-                    fileStream.Write(allLog);
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine("FATAL: Write log to file!\n" + ex);
+                    if (!String.IsNullOrEmpty(lastFile))
+                    {
+                        FileInfo lf = new FileInfo(lastFile);
+                        if (lf.Exists && lf.Length > Settings.MaxFileSizeInBytes)
+                        {
+                            lastFile = GetNewFileName();
+                        }
+                    }
+                    else lastFile = GetNewFileName();
+
+                    using (var fileStream = new StreamWriter(lastFile, true, Encoding))
+                        fileStream.Write(logLine);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine("FATAL: Write log to file!\n" + ex);
+                }
             }
         }
+
 
         private string GetNewFileName()
         {
             string fileTime = DateTime.UtcNow.ToString("yyyyMMdd.HHmmss");
             return Path.Combine(Settings.LogFolderPath, String.Concat(Settings.LogFileName, fileTime, LoggerFileExt));
         }
-
-        #endregion
 
 
         #region// WriteByLevel
